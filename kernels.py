@@ -72,8 +72,18 @@ def sgemm_coalesced(A, B, C, M, N, K):
     and modulo by BLOCKSIZE. 
     Be careful which one indexes the column.
     """
-    # TODO
-    return
+    tid = cuda.threadIdx.x
+    row_in_tile = tid // BLOCKSIZE
+    col_in_tile = tid % BLOCKSIZE
+
+    row = cuda.blockIdx.x * BLOCKSIZE + row_in_tile
+    col = cuda.blockIdx.y * BLOCKSIZE + col_in_tile
+
+    if row < M and col < N:
+        acc = float32(0.0)
+        for k in range(K):
+            acc += A[row, k] * B[k, col]
+        C[row, col] = acc
 
 
 # ── K3: shared-memory cache-blocking (TODO) ─────────────────────────
@@ -97,8 +107,41 @@ def sgemm_smem(A, B, C, M, N, K):
     (BK3, BN3) for Bs.
     Use 0.0 in the SMEM load when the global index is out of bounds.
     """
-    # TODO
-    return
+    As = cuda.shared.array((BM3, BK3), float32)
+    Bs = cuda.shared.array((BK3, BN3), float32)
+
+    tid = cuda.threadIdx.x
+    row_in_tile = tid // BN3
+    col_in_tile = tid % BN3
+
+    row = cuda.blockIdx.x * BM3 + row_in_tile
+    col = cuda.blockIdx.y * BN3 + col_in_tile
+
+    acc = float32(0.0)
+
+    for k0 in range(0, K, BK3):
+        a_col = k0 + col_in_tile
+        b_row = k0 + row_in_tile
+
+        if row < M and a_col < K:
+            As[row_in_tile, col_in_tile] = A[row, a_col]
+        else:
+            As[row_in_tile, col_in_tile] = 0.0
+
+        if b_row < K and col < N:
+            Bs[row_in_tile, col_in_tile] = B[b_row, col]
+        else:
+            Bs[row_in_tile, col_in_tile] = 0.0
+
+        cuda.syncthreads()
+
+        for kk in range(BK3):
+            acc += As[row_in_tile, kk] * Bs[kk, col_in_tile]
+
+        cuda.syncthreads()
+
+    if row < M and col < N:
+        C[row, col] = acc
 
 
 # ── K4: 1D register tiling (TODO) ───────────────────────────────────
@@ -123,8 +166,58 @@ def sgemm_1d_tile(A, B, C, M, N, K):
     Use cuda.local.array(TM4, float32) for the per-thread accumulator array.
     Initialize all entries to 0.0 before the K-loop.
     """
-    # TODO
-    return
+    As = cuda.shared.array((BM4, BK4), float32)
+    Bs = cuda.shared.array((BK4, BN4), float32)
+    acc = cuda.local.array(TM4, float32)
+
+    tid = cuda.threadIdx.x
+    row_group = tid // BN4
+    col_in_tile = tid % BN4
+    row_base_in_tile = row_group * TM4
+
+    block_row = cuda.blockIdx.y * BM4
+    block_col = cuda.blockIdx.x * BN4
+
+    col = block_col + col_in_tile
+    row_base = block_row + row_base_in_tile
+
+    for i in range(TM4):
+        acc[i] = 0.0
+
+    a_row = tid // BK4
+    a_col = tid % BK4
+    b_row = tid // BN4
+    b_col = tid % BN4
+
+    for k0 in range(0, K, BK4):
+        a_global_row = block_row + a_row
+        a_global_col = k0 + a_col
+        if a_global_row < M and a_global_col < K:
+            As[a_row, a_col] = A[a_global_row, a_global_col]
+        else:
+            As[a_row, a_col] = 0.0
+
+        b_global_row = k0 + b_row
+        b_global_col = block_col + b_col
+        if b_global_row < K and b_global_col < N:
+            Bs[b_row, b_col] = B[b_global_row, b_global_col]
+        else:
+            Bs[b_row, b_col] = 0.0
+
+        cuda.syncthreads()
+
+        for kk in range(BK4):
+            b_val = Bs[kk, col_in_tile]
+            for i in range(TM4):
+                acc[i] += As[row_base_in_tile + i, kk] * b_val
+
+        cuda.syncthreads()
+
+    if col < N:
+        for i in range(TM4):
+            row = row_base + i
+            if row < M:
+                C[row, col] = acc[i]
 
 
 # ── K5: 2D register tiling (TODO) ───────────────────────────────────
@@ -148,8 +241,77 @@ def sgemm_2d_tile(A, B, C, M, N, K):
     For accumulators, use cuda.local.array((TM5, TN5), float32).
     Numba supports tuple-shaped local arrays!
     """
-    # TODO
-    return
+    As = cuda.shared.array((BM5, BK5), float32)
+    Bs = cuda.shared.array((BK5, BN5), float32)
+    acc = cuda.local.array((TM5, TN5), float32)
+    reg_a = cuda.local.array(TM5, float32)
+    reg_b = cuda.local.array(TN5, float32)
+
+    tid = cuda.threadIdx.x
+    threads_per_row = BN5 // TN5
+    row_group = tid // threads_per_row
+    col_group = tid % threads_per_row
+    row_base_in_tile = row_group * TM5
+    col_base_in_tile = col_group * TN5
+
+    block_row = cuda.blockIdx.y * BM5
+    block_col = cuda.blockIdx.x * BN5
+    row_base = block_row + row_base_in_tile
+    col_base = block_col + col_base_in_tile
+
+    for i in range(TM5):
+        for j in range(TN5):
+            acc[i, j] = 0.0
+
+    a_row = tid // BK5
+    a_col = tid % BK5
+    a_row_stride = ((BM5 * BN5) // (TM5 * TN5)) // BK5
+
+    b_row = tid // BN5
+    b_col = tid % BN5
+    b_row_stride = ((BM5 * BN5) // (TM5 * TN5)) // BN5
+
+    for k0 in range(0, K, BK5):
+        for load_idx in range(BM5 // a_row_stride):
+            smem_row = a_row + load_idx * a_row_stride
+            gmem_row = block_row + smem_row
+            gmem_col = k0 + a_col
+            if gmem_row < M and gmem_col < K:
+                As[smem_row, a_col] = A[gmem_row, gmem_col]
+            else:
+                As[smem_row, a_col] = 0.0
+
+        for load_idx in range(BK5 // b_row_stride):
+            smem_row = b_row + load_idx * b_row_stride
+            gmem_row = k0 + smem_row
+            gmem_col = block_col + b_col
+            if gmem_row < K and gmem_col < N:
+                Bs[smem_row, b_col] = B[gmem_row, gmem_col]
+            else:
+                Bs[smem_row, b_col] = 0.0
+
+        cuda.syncthreads()
+
+        for kk in range(BK5):
+            for i in range(TM5):
+                reg_a[i] = As[row_base_in_tile + i, kk]
+            for j in range(TN5):
+                reg_b[j] = Bs[kk, col_base_in_tile + j]
+
+            for i in range(TM5):
+                a_val = reg_a[i]
+                for j in range(TN5):
+                    acc[i, j] += a_val * reg_b[j]
+
+        cuda.syncthreads()
+
+    for i in range(TM5):
+        row = row_base + i
+        if row < M:
+            for j in range(TN5):
+                col = col_base + j
+                if col < N:
+                    C[row, col] = acc[i, j]
 
 
 # ── Launch wrappers (provided — do not edit) ────────────────────────
